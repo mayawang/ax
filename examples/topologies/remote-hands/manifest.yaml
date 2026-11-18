@@ -1,0 +1,92 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Decoupled Brain and Hands:
+# - Gateway (`hands-egress`) restricts sandbox egress and injects external
+#   credentials outside the sandbox via Agent Substrate's EgressPolicy.
+# - Workspace (`hands-workspace`) seeds a failing Python utility in /workspace.
+# - Task (`hands-sandbox`) provides the isolated execution sandbox driven
+#   remotely by `brain.py` over `ax ssh`.
+apiVersion: ax.io/v1alpha1
+kind: Gateway
+metadata:
+  name: hands-egress
+  atespace: default
+spec:
+  egress:
+    - https:
+        hostnames: ["github.com", "api.github.com", "*.githubusercontent.com"]
+    - https:
+        hostnames: ["api.anthropic.com"]
+        effects:
+          replaceHeaders:
+            - header: x-api-key
+              credentialUri: "ate-secret://k8s.io/default/ax-system/anthropic-creds/api-key"
+---
+apiVersion: ax.io/v1alpha1
+kind: Workspace
+metadata:
+  name: hands-workspace
+  atespace: default
+spec:
+  setup:
+    files:
+      - path: "calc.py"
+        content: |
+          def parse_timeout(raw: str) -> int:
+              """Parse timeout in seconds, rejecting negative values."""
+              val = int(raw.strip())
+              # BUG: off-by-one allows negative -1 sentinel through
+              if val < -1:
+                  raise ValueError("timeout must be non-negative")
+              return val
+      - path: "test_calc.py"
+        content: |
+          import unittest
+          from calc import parse_timeout
+
+          class TestParseTimeout(unittest.TestCase):
+              def test_valid_timeout(self):
+                  self.assertEqual(parse_timeout("30"), 30)
+
+              def test_rejects_negative_one(self):
+                  with self.assertRaises(ValueError):
+                      parse_timeout("-1")
+
+          if __name__ == "__main__":
+              unittest.main()
+---
+apiVersion: ax.io/v1alpha1
+kind: Task
+metadata:
+  name: hands-sandbox
+  atespace: default
+spec:
+  # Uses ax-server's --default-task-image; pin a custom digest here if needed.
+  profile:
+    resources:
+      limits:
+        cpu: "1"
+        memory: "1Gi"
+  workspace:
+    name: hands-workspace
+  gateway:
+    name: hands-egress
+  env:
+    - name: SANDBOX_ROLE
+      value: "remote-hands"
+    - name: ANTHROPIC_API_KEY
+      value: "placeholder"
+  commands: ["sleep", "infinity"]
+  debug: true # serve guest services inside the sandbox so `ax ssh` works

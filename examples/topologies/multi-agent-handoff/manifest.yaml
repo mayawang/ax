@@ -1,0 +1,176 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: ax.io/v1alpha1
+kind: Workspace
+metadata:
+  name: repo-fixing-ws
+  atespace: default
+spec:
+  setup:
+    files:
+      - path: "calc.py"
+        content: |
+          def parse_timeout(raw: str) -> int:
+              """Parse timeout in seconds, rejecting negative values."""
+              val = int(raw.strip())
+              # BUG: off-by-one allows -1 through
+              if val < -1:
+                  raise ValueError("timeout must be non-negative")
+              return val
+      - path: "test_calc.py"
+        content: |
+          import unittest
+          from calc import parse_timeout
+
+          class TestParseTimeout(unittest.TestCase):
+              def test_valid_timeout(self):
+                  self.assertEqual(parse_timeout("30"), 30)
+
+              def test_rejects_negative_one(self):
+                  with self.assertRaises(ValueError):
+                      parse_timeout("-1")
+
+          if __name__ == "__main__":
+              unittest.main()
+---
+apiVersion: ax.io/v1alpha1
+kind: Gateway
+metadata:
+  name: github-egress
+  atespace: default
+spec:
+  egress:
+    - https:
+        hostnames: ["api.github.com"]
+        ports:
+          numbers: [443]
+        effects:
+          replaceHeaders:
+            - header: Authorization
+              prefix: "Bearer "
+              credentialUri: "ate-secret://k8s.io/default/ax-system/github-token/token"
+---
+apiVersion: ax.io/v1alpha1
+kind: Task
+metadata:
+  name: github-issue-triage
+  atespace: default
+spec:
+  # Uses ax-server's --default-task-image; pin a custom digest here if needed.
+  profile:
+    resources:
+      limits:
+        cpu: "1"
+        memory: "1Gi"
+  workspace:
+    name: repo-fixing-ws
+  gateway:
+    name: github-egress
+  env:
+    - name: GITHUB_TOKEN
+      value: placeholder # replaced outside the sandbox by github-egress when github-token exists
+  commands:
+    - sh
+    - -c
+    - |
+      set -u
+      echo "=== Step 1: Probe api.github.com via github-egress ==="
+      gh_status=$(curl -sS -o /tmp/zen.txt -w "%{http_code}" --connect-timeout 5 \
+        -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+        https://api.github.com/zen 2>/tmp/curl.err || echo "err")
+      echo "api.github.com status: ${gh_status}"
+
+      echo "=== Step 2: Reproduce test failure ==="
+      python3 -m unittest -v test_calc.py > /tmp/repro.log 2>&1 || true
+      cat /tmp/repro.log
+
+      {
+        echo "# Triage Report"
+        echo ""
+        echo "- GitHub API probe (/zen HTTP status): ${gh_status}"
+        echo "- Failing test: TestParseTimeout.test_rejects_negative_one"
+        echo "- Root cause: calc.py rejects \`val < -1\` instead of \`val < 0\`."
+        echo ""
+        echo "## Reproduction Output"
+        echo '```'
+        cat /tmp/repro.log
+        echo '```'
+      } > /workspace/triage-report.md
+      echo "Wrote /workspace/triage-report.md"
+  debug: true
+---
+apiVersion: ax.io/v1alpha1
+kind: Task
+metadata:
+  name: sandboxed-code-fixer
+  atespace: default
+spec:
+  profile:
+    resources:
+      limits:
+        cpu: "1"
+        memory: "1Gi"
+  workspace:
+    name: repo-fixing-ws
+  # No gateway attached: all outbound network traffic is denied by default.
+  commands:
+    - sh
+    - -c
+    - |
+      set -eu
+      echo "Waiting for /workspace/triage-report.md from triage handoff..."
+      i=0
+      while [ ! -f /workspace/triage-report.md ]; do
+        i=$((i + 1))
+        if [ "$i" -ge 180 ]; then
+          echo "Timed out waiting for /workspace/triage-report.md" >&2
+          exit 1
+        fi
+        sleep 1
+      done
+
+      echo "=== Handoff report received ==="
+      head -n 10 /workspace/triage-report.md
+
+      python3 -c '
+      from pathlib import Path
+      p = Path("/workspace/calc.py")
+      src = p.read_text()
+      p.write_text(src.replace("if val < -1:", "if val < 0:").replace("    # BUG: off-by-one allows -1 through\n", ""))
+      '
+
+      echo "=== Run verification tests ==="
+      python3 -m unittest -v test_calc.py > /tmp/verify.log 2>&1
+      cat /tmp/verify.log
+
+      echo "=== Verify air-gapped egress boundary ==="
+      egress_check=$(curl -sS --connect-timeout 3 https://api.github.com/zen 2>&1 || true)
+      echo "${egress_check}"
+
+      {
+        echo "# Fix Report"
+        echo ""
+        echo "Patched /workspace/calc.py (\`val < -1\` -> \`val < 0\`)."
+        echo ""
+        echo "## Test Output"
+        echo '```'
+        cat /tmp/verify.log
+        echo '```'
+        echo ""
+        echo "## Outbound Egress Check (no Gateway)"
+        echo "${egress_check:-blocked}"
+      } > /workspace/fix-report.md
+      echo "Wrote /workspace/fix-report.md"
+  debug: true
